@@ -6,6 +6,7 @@ from app.config import settings
 from app.models.database import init_db
 from app.api.routes import router
 from app.utils.logger import logger
+from app.services.cleanup_service import cleanup_service
 
 
 @asynccontextmanager
@@ -25,10 +26,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"Allowed file extensions: {settings.ALLOWED_EXTENSIONS}")
     logger.info(f"ChromaDB persist directory: {settings.CHROMA_PERSIST_DIR}")
     
+    # Start cleanup scheduler
+    cleanup_service.start()
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Phoenix Agent API...")
+    cleanup_service.stop()
 
 
 # Create FastAPI app
@@ -73,8 +78,22 @@ async def health_check():
     return {
         "status": "healthy",
         "database": "connected",
-        "api_keys_configured": len(settings.GOOGLE_API_KEYS)
+        "api_keys_configured": len(settings.GOOGLE_API_KEYS),
+        "cleanup_scheduler": "running" if cleanup_service.scheduler.running else "stopped",
+        "retention_minutes": settings.REPO_RETENTION_MINUTES
     }
+
+
+@app.get("/api/cleanup/stats")
+async def get_cleanup_stats():
+    """Get repository cleanup statistics"""
+    from app.api.dependencies import get_database
+    db = next(get_database())
+    try:
+        stats = cleanup_service.get_cleanup_stats(db)
+        return stats
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

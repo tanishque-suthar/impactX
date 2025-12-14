@@ -50,6 +50,10 @@ class Settings:
     # Batch update settings
     BATCH_UPDATE_INTERVAL: int = 10  # Update progress every N files
     
+    # Repository retention settings
+    REPO_RETENTION_MINUTES: int = int(os.getenv("REPO_RETENTION_MINUTES", "5"))  # Delete repos after X minutes
+    CLEANUP_CHECK_INTERVAL_SECONDS: int = 120  # Check for old repos every 60 seconds
+    
     def __init__(self):
         """Load and validate configuration"""
         # Load all Google API keys

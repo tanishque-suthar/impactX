@@ -119,10 +119,10 @@ def analyze_repository_background(job_id: int, repo_url: str, branch: Optional[s
         db.commit()
         
         # Update status: Cleaning up
-        update_job_status(db, job_id, "processing", "Cleaning up")
+        update_job_status(db, job_id, "processing", "Cleaning up ChromaDB")
         
-        # Cleanup
-        github_service.cleanup_repository(job_id)
+        # Only cleanup ChromaDB collection, keep repo for retention policy
+        # github_service.cleanup_repository(job_id)  # Now handled by cleanup_service
         if collection_name:
             rag_service.delete_collection(collection_name)
         
