@@ -5,6 +5,7 @@ import ast
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_aws import BedrockEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from app.config import settings
 from app.utils.logger import logger
@@ -21,13 +22,39 @@ class RAGService:
             settings=ChromaSettings(anonymized_telemetry=False)
         )
         
-        # Initialize local embeddings using sentence-transformers
-        logger.info(f"Loading local embedding model: {settings.EMBEDDING_MODEL}")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=settings.EMBEDDING_MODEL,
-            model_kwargs={'device': 'cpu'},  # Use 'cuda' if GPU available
-            encode_kwargs={'normalize_embeddings': True}  # Better for similarity search
-        )
+        # Initialize embeddings based on provider with fallback
+        self.embedding_provider = "local"  # Track active provider
+        
+        if settings.EMBEDDING_PROVIDER == "aws":
+            try:
+                logger.info("Attempting to load AWS Bedrock embeddings (amazon.titan-embed-text-v1)...")
+                self.embeddings = BedrockEmbeddings(
+                    credentials_profile_name=None,  # Use env vars
+                    region_name=settings.AWS_REGION,
+                    model_id="amazon.titan-embed-text-v1"  # Free tier model
+                )
+                # Test the connection with a simple embedding
+                self.embeddings.embed_query("test")
+                self.embedding_provider = "aws"
+                logger.info("✓ Successfully initialized AWS Bedrock embeddings")
+            except Exception as e:
+                logger.warning(f"⚠ AWS Bedrock initialization failed: {str(e)}")
+                logger.info("⟳ Falling back to local embedding model...")
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name=settings.EMBEDDING_MODEL,
+                    model_kwargs={'device': 'cpu'},
+                    encode_kwargs={'normalize_embeddings': True}
+                )
+                logger.info(f"✓ Using local embedding model: {settings.EMBEDDING_MODEL}")
+        else:
+            # Use local embeddings
+            logger.info(f"Loading local embedding model: {settings.EMBEDDING_MODEL}")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=settings.EMBEDDING_MODEL,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            logger.info(f"✓ Using local embedding model: {settings.EMBEDDING_MODEL}")
         
         # Default text splitter (fallback)
         self.default_splitter = RecursiveCharacterTextSplitter(

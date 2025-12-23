@@ -22,8 +22,15 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
     # File whitelist for code analysis
-    # Local embedding model (sentence-transformers)
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # Fast, efficient, good quality
+    # Embedding configuration
+    EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "local")  # 'local' or 'aws'
+    #EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # For local embeddings
+    EMBEDDING_MODEL: str = "paraphrase-MiniLM-L3-v2"
+    
+    # AWS Bedrock settings (for cloud embeddings)
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     
     ALLOWED_EXTENSIONS: List[str] = [
         ".py", ".js", ".ts", ".jsx", ".tsx",
