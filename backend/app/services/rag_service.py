@@ -4,7 +4,7 @@ import re
 import ast
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from app.config import settings
 from app.utils.logger import logger
@@ -67,10 +67,7 @@ class RAGService:
             '.scala': Language.SCALA,
             '.cs': Language.CSHARP,
             '.html': Language.HTML,
-            '.css': Language.CSS,
-            '.md': Language.MARKDOWN,
-            '.tex': Language.LATEX,
-            '.sol': Language.SOL
+            '.md': Language.MARKDOWN
         }
         
         for ext, lang in language_map.items():
@@ -360,20 +357,21 @@ class RAGService:
                 chunk_classes = self._extract_chunk_classes(chunk, extension)
                 chunk_imports = self._extract_chunk_imports(chunk, extension)
                 
+                # Convert lists to comma-separated strings for ChromaDB compatibility
                 if chunk_functions:
-                    chunk_metadata["chunk_functions"] = chunk_functions
+                    chunk_metadata["chunk_functions"] = ",".join(chunk_functions)
                 if chunk_classes:
-                    chunk_metadata["chunk_classes"] = chunk_classes
+                    chunk_metadata["chunk_classes"] = ",".join(chunk_classes)
                 if chunk_imports:
-                    chunk_metadata["chunk_imports"] = chunk_imports
+                    chunk_metadata["chunk_imports"] = ",".join(chunk_imports)
                 
                 # Add all file-level functions, classes, imports as searchable metadata
                 if code_metadata.get("functions"):
-                    chunk_metadata["all_functions"] = [f["name"] for f in code_metadata["functions"]]
+                    chunk_metadata["all_functions"] = ",".join([f["name"] for f in code_metadata["functions"]])
                 if code_metadata.get("classes"):
-                    chunk_metadata["all_classes"] = [c["name"] for c in code_metadata["classes"]]
+                    chunk_metadata["all_classes"] = ",".join([c["name"] for c in code_metadata["classes"]])
                 if code_metadata.get("imports"):
-                    chunk_metadata["all_imports"] = code_metadata["imports"]
+                    chunk_metadata["all_imports"] = ",".join(code_metadata["imports"])
                 
                 all_metadatas.append(chunk_metadata)
                 all_ids.append(f"chunk_{chunk_id}")
@@ -561,27 +559,38 @@ class RAGService:
         try:
             collection = self.chroma_client.get_collection(name=collection_name)
             
-            # Query using metadata filters
-            results = collection.get(
-                where={
-                    "$or": [
-                        {"chunk_functions": {"$contains": function_name}},
-                        {"all_functions": {"$contains": function_name}}
-                    ]
-                },
-                limit=top_k,
+            # Get all documents and filter in Python (ChromaDB string contains doesn't work as expected)
+            all_results = collection.get(
+                limit=top_k * 10,  # Get more results to filter
                 include=["documents", "metadatas"]
             )
             
+            # Filter results that contain the function name
+            filtered_docs = []
+            filtered_metas = []
+            
+            if all_results and all_results["documents"]:
+                for idx, metadata in enumerate(all_results["metadatas"]):
+                    chunk_funcs = metadata.get("chunk_functions", "")
+                    all_funcs = metadata.get("all_functions", "")
+                    
+                    # Check if function name appears in comma-separated strings
+                    if function_name in chunk_funcs.split(",") or function_name in all_funcs.split(","):
+                        filtered_docs.append(all_results["documents"][idx])
+                        filtered_metas.append(metadata)
+                        if len(filtered_docs) >= top_k:
+                            break
+            
+            results = {"documents": filtered_docs, "metadatas": filtered_metas}
+            
             # Format results
             formatted_results = []
-            if results and results["documents"]:
-                for idx in range(len(results["documents"])):
-                    formatted_results.append({
-                        "content": results["documents"][idx],
-                        "metadata": results["metadatas"][idx],
-                        "distance": None  # No distance for metadata-based queries
-                    })
+            for idx in range(len(results["documents"])):
+                formatted_results.append({
+                    "content": results["documents"][idx],
+                    "metadata": results["metadatas"][idx],
+                    "distance": None  # No distance for metadata-based queries
+                })
             
             return formatted_results
             
@@ -612,27 +621,38 @@ class RAGService:
         try:
             collection = self.chroma_client.get_collection(name=collection_name)
             
-            # Query using metadata filters
-            results = collection.get(
-                where={
-                    "$or": [
-                        {"chunk_classes": {"$contains": class_name}},
-                        {"all_classes": {"$contains": class_name}}
-                    ]
-                },
-                limit=top_k,
+            # Get all documents and filter in Python
+            all_results = collection.get(
+                limit=top_k * 10,  # Get more results to filter
                 include=["documents", "metadatas"]
             )
             
+            # Filter results that contain the class name
+            filtered_docs = []
+            filtered_metas = []
+            
+            if all_results and all_results["documents"]:
+                for idx, metadata in enumerate(all_results["metadatas"]):
+                    chunk_classes = metadata.get("chunk_classes", "")
+                    all_classes = metadata.get("all_classes", "")
+                    
+                    # Check if class name appears in comma-separated strings
+                    if class_name in chunk_classes.split(",") or class_name in all_classes.split(","):
+                        filtered_docs.append(all_results["documents"][idx])
+                        filtered_metas.append(metadata)
+                        if len(filtered_docs) >= top_k:
+                            break
+            
+            results = {"documents": filtered_docs, "metadatas": filtered_metas}
+            
             # Format results
             formatted_results = []
-            if results and results["documents"]:
-                for idx in range(len(results["documents"])):
-                    formatted_results.append({
-                        "content": results["documents"][idx],
-                        "metadata": results["metadatas"][idx],
-                        "distance": None
-                    })
+            for idx in range(len(results["documents"])):
+                formatted_results.append({
+                    "content": results["documents"][idx],
+                    "metadata": results["metadatas"][idx],
+                    "distance": None
+                })
             
             return formatted_results
             
