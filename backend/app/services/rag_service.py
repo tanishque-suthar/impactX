@@ -1,15 +1,17 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pathlib import Path
+import re
+import ast
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from app.config import settings
 from app.utils.logger import logger
 
 
 class RAGService:
-    """Service for RAG operations using ChromaDB"""
+    """Service for RAG operations using ChromaDB with code-aware processing"""
     
     def __init__(self):
         """Initialize ChromaDB client and embeddings"""
@@ -27,15 +29,227 @@ class RAGService:
             encode_kwargs={'normalize_embeddings': True}  # Better for similarity search
         )
         
-        # Text splitter with 15% overlap
-        self.text_splitter = RecursiveCharacterTextSplitter(
+        # Default text splitter (fallback)
+        self.default_splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.CHUNK_SIZE,
             chunk_overlap=settings.CHUNK_OVERLAP,
             length_function=len,
             separators=["\n\n", "\n", " ", ""]
         )
         
-        logger.info("RAGService initialized with ChromaDB")
+        # Language-specific splitters
+        self.language_splitters = self._initialize_language_splitters()
+        
+        logger.info("RAGService initialized with ChromaDB and code-aware splitting")
+    
+    def _initialize_language_splitters(self) -> Dict[str, RecursiveCharacterTextSplitter]:
+        """Initialize language-specific text splitters"""
+        splitters = {}
+        
+        # Language mapping for supported languages
+        language_map = {
+            '.py': Language.PYTHON,
+            '.js': Language.JS,
+            '.jsx': Language.JS,
+            '.ts': Language.TS,
+            '.tsx': Language.TS,
+            '.java': Language.JAVA,
+            '.cpp': Language.CPP,
+            '.c': Language.CPP,
+            '.cc': Language.CPP,
+            '.cxx': Language.CPP,
+            '.go': Language.GO,
+            '.rs': Language.RUST,
+            '.php': Language.PHP,
+            '.rb': Language.RUBY,
+            '.swift': Language.SWIFT,
+            '.kt': Language.KOTLIN,
+            '.scala': Language.SCALA,
+            '.cs': Language.CSHARP,
+            '.html': Language.HTML,
+            '.css': Language.CSS,
+            '.md': Language.MARKDOWN,
+            '.tex': Language.LATEX,
+            '.sol': Language.SOL
+        }
+        
+        for ext, lang in language_map.items():
+            try:
+                splitters[ext] = RecursiveCharacterTextSplitter.from_language(
+                    language=lang,
+                    chunk_size=settings.CHUNK_SIZE,
+                    chunk_overlap=settings.CHUNK_OVERLAP
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create splitter for {ext}: {e}")
+                splitters[ext] = self.default_splitter
+        
+        return splitters
+    
+    def _get_splitter_for_file(self, extension: str) -> RecursiveCharacterTextSplitter:
+        """Get appropriate text splitter for file extension"""
+        return self.language_splitters.get(extension, self.default_splitter)
+    
+    def _extract_code_metadata(self, content: str, extension: str, file_path: str) -> Dict:
+        """Extract code-specific metadata from file content"""
+        metadata = {
+            "functions": [],
+            "classes": [],
+            "imports": [],
+            "complexity_score": 0,
+            "lines_of_code": len([line for line in content.split('\n') if line.strip()]),
+            "total_lines": len(content.split('\n'))
+        }
+        
+        try:
+            if extension == '.py':
+                metadata.update(self._extract_python_metadata(content))
+            elif extension in ['.js', '.jsx', '.ts', '.tsx']:
+                metadata.update(self._extract_javascript_metadata(content))
+            elif extension == '.java':
+                metadata.update(self._extract_java_metadata(content))
+            # Add more language-specific extractors as needed
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract metadata for {file_path}: {e}")
+        
+        return metadata
+    
+    def _extract_python_metadata(self, content: str) -> Dict:
+        """Extract Python-specific metadata using AST"""
+        metadata = {"functions": [], "classes": [], "imports": [], "complexity_score": 0}
+        
+        try:
+            tree = ast.parse(content)
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    metadata["functions"].append({
+                        "name": node.name,
+                        "line": node.lineno,
+                        "args": [arg.arg for arg in node.args.args],
+                        "is_async": isinstance(node, ast.AsyncFunctionDef)
+                    })
+                elif isinstance(node, ast.ClassDef):
+                    metadata["classes"].append({
+                        "name": node.name,
+                        "line": node.lineno,
+                        "bases": [base.id if isinstance(base, ast.Name) else str(base) for base in node.bases]
+                    })
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            metadata["imports"].append(alias.name)
+                    else:  # ImportFrom
+                        module = node.module or ""
+                        for alias in node.names:
+                            metadata["imports"].append(f"{module}.{alias.name}" if module else alias.name)
+            
+            # Simple complexity score based on control flow nodes
+            complexity_nodes = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.AsyncWith)
+            metadata["complexity_score"] = sum(1 for node in ast.walk(tree) if isinstance(node, complexity_nodes))
+            
+        except SyntaxError as e:
+            logger.warning(f"Python syntax error during metadata extraction: {e}")
+        except Exception as e:
+            logger.warning(f"Error extracting Python metadata: {e}")
+        
+        return metadata
+    
+    def _extract_javascript_metadata(self, content: str) -> Dict:
+        """Extract JavaScript/TypeScript metadata using regex patterns"""
+        metadata = {"functions": [], "classes": [], "imports": [], "complexity_score": 0}
+        
+        try:
+            # Function patterns
+            func_patterns = [
+                r'function\s+(\w+)\s*\(',
+                r'const\s+(\w+)\s*=\s*\([^)]*\)\s*=>',
+                r'(\w+)\s*:\s*function\s*\(',
+                r'async\s+function\s+(\w+)\s*\('
+            ]
+            
+            for pattern in func_patterns:
+                matches = re.finditer(pattern, content, re.MULTILINE)
+                for match in matches:
+                    metadata["functions"].append({
+                        "name": match.group(1),
+                        "line": content[:match.start()].count('\n') + 1
+                    })
+            
+            # Class patterns
+            class_matches = re.finditer(r'class\s+(\w+)', content, re.MULTILINE)
+            for match in class_matches:
+                metadata["classes"].append({
+                    "name": match.group(1),
+                    "line": content[:match.start()].count('\n') + 1
+                })
+            
+            # Import patterns
+            import_patterns = [
+                r'import\s+.*?from\s+[\'"]([^\'"]+)[\'"]',
+                r'import\s+[\'"]([^\'"]+)[\'"]',
+                r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)'
+            ]
+            
+            for pattern in import_patterns:
+                matches = re.finditer(pattern, content, re.MULTILINE)
+                for match in matches:
+                    metadata["imports"].append(match.group(1))
+            
+            # Simple complexity score
+            complexity_patterns = [r'\bif\b', r'\bfor\b', r'\bwhile\b', r'\btry\b', r'\bcatch\b']
+            metadata["complexity_score"] = sum(
+                len(re.findall(pattern, content, re.IGNORECASE)) for pattern in complexity_patterns
+            )
+            
+        except Exception as e:
+            logger.warning(f"Error extracting JavaScript metadata: {e}")
+        
+        return metadata
+    
+    def _extract_java_metadata(self, content: str) -> Dict:
+        """Extract Java metadata using regex patterns"""
+        metadata = {"functions": [], "classes": [], "imports": [], "complexity_score": 0}
+        
+        try:
+            # Method patterns
+            method_matches = re.finditer(
+                r'(?:public|private|protected|static|\s)*\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{',
+                content, re.MULTILINE
+            )
+            for match in method_matches:
+                metadata["functions"].append({
+                    "name": match.group(1),
+                    "line": content[:match.start()].count('\n') + 1
+                })
+            
+            # Class patterns
+            class_matches = re.finditer(
+                r'(?:public|private|protected|\s)*\s*class\s+(\w+)',
+                content, re.MULTILINE
+            )
+            for match in class_matches:
+                metadata["classes"].append({
+                    "name": match.group(1),
+                    "line": content[:match.start()].count('\n') + 1
+                })
+            
+            # Import patterns
+            import_matches = re.finditer(r'import\s+([^;]+);', content, re.MULTILINE)
+            for match in import_matches:
+                metadata["imports"].append(match.group(1).strip())
+            
+            # Complexity score
+            complexity_patterns = [r'\bif\b', r'\bfor\b', r'\bwhile\b', r'\btry\b', r'\bcatch\b']
+            metadata["complexity_score"] = sum(
+                len(re.findall(pattern, content, re.IGNORECASE)) for pattern in complexity_patterns
+            )
+            
+        except Exception as e:
+            logger.warning(f"Error extracting Java metadata: {e}")
+        
+        return metadata
     
     def _sanitize_collection_name(self, repo_url: str, job_id: int) -> str:
         """
@@ -69,7 +283,7 @@ class RAGService:
         progress_callback=None
     ) -> str:
         """
-        Create embeddings for repository files
+        Create embeddings for repository files with code-aware processing
         
         Args:
             files_data: List of file metadata with content
@@ -113,18 +327,55 @@ class RAGService:
             if not content.strip():
                 continue
             
-            # Split content into chunks
-            chunks = self.text_splitter.split_text(content)
+            # Extract code metadata for the entire file
+            code_metadata = self._extract_code_metadata(content, extension, file_path)
+            
+            # Get appropriate splitter for this file type
+            splitter = self._get_splitter_for_file(extension)
+            
+            # Split content into chunks using code-aware splitter
+            chunks = splitter.split_text(content)
             
             # Prepare documents for this file
             for chunk_idx, chunk in enumerate(chunks):
                 all_documents.append(chunk)
-                all_metadatas.append({
+                
+                # Enhanced metadata with code information
+                chunk_metadata = {
                     "file_path": file_path,
                     "chunk_index": chunk_idx,
                     "language": extension,
-                    "total_chunks": len(chunks)
-                })
+                    "total_chunks": len(chunks),
+                    # File-level metadata
+                    "file_functions_count": len(code_metadata.get("functions", [])),
+                    "file_classes_count": len(code_metadata.get("classes", [])),
+                    "file_imports_count": len(code_metadata.get("imports", [])),
+                    "file_complexity_score": code_metadata.get("complexity_score", 0),
+                    "file_lines_of_code": code_metadata.get("lines_of_code", 0),
+                    "file_total_lines": code_metadata.get("total_lines", 0),
+                }
+                
+                # Add chunk-specific code elements if they exist in this chunk
+                chunk_functions = self._extract_chunk_functions(chunk, extension)
+                chunk_classes = self._extract_chunk_classes(chunk, extension)
+                chunk_imports = self._extract_chunk_imports(chunk, extension)
+                
+                if chunk_functions:
+                    chunk_metadata["chunk_functions"] = chunk_functions
+                if chunk_classes:
+                    chunk_metadata["chunk_classes"] = chunk_classes
+                if chunk_imports:
+                    chunk_metadata["chunk_imports"] = chunk_imports
+                
+                # Add all file-level functions, classes, imports as searchable metadata
+                if code_metadata.get("functions"):
+                    chunk_metadata["all_functions"] = [f["name"] for f in code_metadata["functions"]]
+                if code_metadata.get("classes"):
+                    chunk_metadata["all_classes"] = [c["name"] for c in code_metadata["classes"]]
+                if code_metadata.get("imports"):
+                    chunk_metadata["all_imports"] = code_metadata["imports"]
+                
+                all_metadatas.append(chunk_metadata)
                 all_ids.append(f"chunk_{chunk_id}")
                 chunk_id += 1
             
@@ -159,6 +410,84 @@ class RAGService:
             logger.error(f"WARNING: Collection {collection_name} is empty after adding {chunk_id} chunks!")
         
         return collection_name
+    
+    def _extract_chunk_functions(self, chunk: str, extension: str) -> List[str]:
+        """Extract function names that appear in this specific chunk"""
+        functions = []
+        try:
+            if extension == '.py':
+                # Look for function definitions in this chunk
+                matches = re.finditer(r'def\s+(\w+)\s*\(', chunk, re.MULTILINE)
+                functions = [match.group(1) for match in matches]
+            elif extension in ['.js', '.jsx', '.ts', '.tsx']:
+                patterns = [
+                    r'function\s+(\w+)\s*\(',
+                    r'const\s+(\w+)\s*=\s*\([^)]*\)\s*=>',
+                    r'(\w+)\s*:\s*function\s*\('
+                ]
+                for pattern in patterns:
+                    matches = re.finditer(pattern, chunk, re.MULTILINE)
+                    functions.extend([match.group(1) for match in matches])
+            elif extension == '.java':
+                matches = re.finditer(
+                    r'(?:public|private|protected|static|\s)*\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{',
+                    chunk, re.MULTILINE
+                )
+                functions = [match.group(1) for match in matches]
+        except Exception as e:
+            logger.warning(f"Error extracting chunk functions: {e}")
+        
+        return functions
+    
+    def _extract_chunk_classes(self, chunk: str, extension: str) -> List[str]:
+        """Extract class names that appear in this specific chunk"""
+        classes = []
+        try:
+            if extension == '.py':
+                matches = re.finditer(r'class\s+(\w+)', chunk, re.MULTILINE)
+                classes = [match.group(1) for match in matches]
+            elif extension in ['.js', '.jsx', '.ts', '.tsx']:
+                matches = re.finditer(r'class\s+(\w+)', chunk, re.MULTILINE)
+                classes = [match.group(1) for match in matches]
+            elif extension == '.java':
+                matches = re.finditer(
+                    r'(?:public|private|protected|\s)*\s*class\s+(\w+)',
+                    chunk, re.MULTILINE
+                )
+                classes = [match.group(1) for match in matches]
+        except Exception as e:
+            logger.warning(f"Error extracting chunk classes: {e}")
+        
+        return classes
+    
+    def _extract_chunk_imports(self, chunk: str, extension: str) -> List[str]:
+        """Extract import statements that appear in this specific chunk"""
+        imports = []
+        try:
+            if extension == '.py':
+                # Python imports
+                import_matches = re.finditer(r'(?:from\s+(\S+)\s+)?import\s+([^\n]+)', chunk, re.MULTILINE)
+                for match in import_matches:
+                    if match.group(1):  # from ... import
+                        imports.append(f"{match.group(1)}.{match.group(2).split(',')[0].strip()}")
+                    else:  # import
+                        imports.append(match.group(2).split(',')[0].strip())
+            elif extension in ['.js', '.jsx', '.ts', '.tsx']:
+                patterns = [
+                    r'import\s+.*?from\s+[\'"]([^\'"]+)[\'"]',
+                    r'import\s+[\'"]([^\'"]+)[\'"]',
+                    r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)'
+                ]
+                for pattern in patterns:
+                    matches = re.finditer(pattern, chunk, re.MULTILINE)
+                    imports.extend([match.group(1) for match in matches])
+            elif extension == '.java':
+                matches = re.finditer(r'import\s+([^;]+);', chunk, re.MULTILINE)
+                imports = [match.group(1).strip() for match in matches]
+        except Exception as e:
+            logger.warning(f"Error extracting chunk imports: {e}")
+        
+        return imports
     
     def query_similar_code(
         self,
@@ -209,25 +538,230 @@ class RAGService:
             logger.error(f"Failed to query collection {collection_name}: {e}")
             return []
     
+    def query_code_by_function(
+        self,
+        collection_name: str,
+        function_name: str,
+        top_k: int = None
+    ) -> List[Dict]:
+        """
+        Query for code chunks containing specific function names
+        
+        Args:
+            collection_name: ChromaDB collection name
+            function_name: Function name to search for
+            top_k: Number of results to return
+            
+        Returns:
+            List of code chunks containing the function
+        """
+        if top_k is None:
+            top_k = settings.TOP_K_RESULTS
+        
+        try:
+            collection = self.chroma_client.get_collection(name=collection_name)
+            
+            # Query using metadata filters
+            results = collection.get(
+                where={
+                    "$or": [
+                        {"chunk_functions": {"$contains": function_name}},
+                        {"all_functions": {"$contains": function_name}}
+                    ]
+                },
+                limit=top_k,
+                include=["documents", "metadatas"]
+            )
+            
+            # Format results
+            formatted_results = []
+            if results and results["documents"]:
+                for idx in range(len(results["documents"])):
+                    formatted_results.append({
+                        "content": results["documents"][idx],
+                        "metadata": results["metadatas"][idx],
+                        "distance": None  # No distance for metadata-based queries
+                    })
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Failed to query by function {function_name}: {e}")
+            return []
+    
+    def query_code_by_class(
+        self,
+        collection_name: str,
+        class_name: str,
+        top_k: int = None
+    ) -> List[Dict]:
+        """
+        Query for code chunks containing specific class names
+        
+        Args:
+            collection_name: ChromaDB collection name
+            class_name: Class name to search for
+            top_k: Number of results to return
+            
+        Returns:
+            List of code chunks containing the class
+        """
+        if top_k is None:
+            top_k = settings.TOP_K_RESULTS
+        
+        try:
+            collection = self.chroma_client.get_collection(name=collection_name)
+            
+            # Query using metadata filters
+            results = collection.get(
+                where={
+                    "$or": [
+                        {"chunk_classes": {"$contains": class_name}},
+                        {"all_classes": {"$contains": class_name}}
+                    ]
+                },
+                limit=top_k,
+                include=["documents", "metadatas"]
+            )
+            
+            # Format results
+            formatted_results = []
+            if results and results["documents"]:
+                for idx in range(len(results["documents"])):
+                    formatted_results.append({
+                        "content": results["documents"][idx],
+                        "metadata": results["metadatas"][idx],
+                        "distance": None
+                    })
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Failed to query by class {class_name}: {e}")
+            return []
+    
+    def query_code_by_language(
+        self,
+        collection_name: str,
+        language: str,
+        query: str = None,
+        top_k: int = None
+    ) -> List[Dict]:
+        """
+        Query for code chunks in a specific programming language
+        
+        Args:
+            collection_name: ChromaDB collection name
+            language: File extension (e.g., '.py', '.js')
+            query: Optional semantic query within the language
+            top_k: Number of results to return
+            
+        Returns:
+            List of code chunks in the specified language
+        """
+        if top_k is None:
+            top_k = settings.TOP_K_RESULTS
+        
+        try:
+            collection = self.chroma_client.get_collection(name=collection_name)
+            
+            if query:
+                # Semantic search within language
+                query_embedding = self.embeddings.embed_query(query)
+                results = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    where={"language": language},
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                formatted_results = []
+                if results and results["documents"]:
+                    for idx in range(len(results["documents"][0])):
+                        formatted_results.append({
+                            "content": results["documents"][0][idx],
+                            "metadata": results["metadatas"][0][idx],
+                            "distance": results["distances"][0][idx] if "distances" in results else None
+                        })
+            else:
+                # Just filter by language
+                results = collection.get(
+                    where={"language": language},
+                    limit=top_k,
+                    include=["documents", "metadatas"]
+                )
+                
+                formatted_results = []
+                if results and results["documents"]:
+                    for idx in range(len(results["documents"])):
+                        formatted_results.append({
+                            "content": results["documents"][idx],
+                            "metadata": results["metadatas"][idx],
+                            "distance": None
+                        })
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Failed to query by language {language}: {e}")
+            return []
+    
     def get_collection_stats(self, collection_name: str) -> Dict:
         """
-        Get statistics about a collection
+        Get enhanced statistics about a collection including code metadata
         
         Args:
             collection_name: Collection name
             
         Returns:
-            Dictionary with collection statistics
+            Dictionary with comprehensive collection statistics
         """
         try:
             collection = self.chroma_client.get_collection(name=collection_name)
             count = collection.count()
             
-            return {
+            # Get sample of metadata to analyze
+            sample_data = collection.get(
+                limit=min(100, count),  # Sample up to 100 items
+                include=["metadatas"]
+            )
+            
+            stats = {
                 "name": collection_name,
                 "total_chunks": count,
                 "metadata": collection.metadata
             }
+            
+            if sample_data and sample_data["metadatas"]:
+                # Analyze languages
+                languages = {}
+                total_functions = 0
+                total_classes = 0
+                total_complexity = 0
+                files_analyzed = set()
+                
+                for metadata in sample_data["metadatas"]:
+                    lang = metadata.get("language", "unknown")
+                    languages[lang] = languages.get(lang, 0) + 1
+                    
+                    # Count file-level stats only once per file
+                    file_path = metadata.get("file_path")
+                    if file_path and file_path not in files_analyzed:
+                        files_analyzed.add(file_path)
+                        total_functions += metadata.get("file_functions_count", 0)
+                        total_classes += metadata.get("file_classes_count", 0)
+                        total_complexity += metadata.get("file_complexity_score", 0)
+                
+                stats.update({
+                    "languages": languages,
+                    "unique_files_sampled": len(files_analyzed),
+                    "total_functions_sampled": total_functions,
+                    "total_classes_sampled": total_classes,
+                    "avg_complexity_sampled": total_complexity / len(files_analyzed) if files_analyzed else 0
+                })
+            
+            return stats
+            
         except Exception as e:
             logger.error(f"Failed to get collection stats: {e}")
             return {}
